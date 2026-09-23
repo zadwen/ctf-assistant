@@ -1,0 +1,10 @@
+# Python dependencies for ctf_assistant.py
+#
+# Only one third-party package is required. Everything else the script
+# uses (subprocess, ipaddress, socket, pathlib, dataclasses, etc.) is
+# from the Python 3 standard library.
+#
+# If 'rich' is not installed, the script auto-detects this and falls back
+# to plain ANSI-colored output — it will still run correctly.
+
+rich>=13.0.0
