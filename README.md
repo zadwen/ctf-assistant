@@ -37,6 +37,66 @@ scanning is illegal in most jurisdictions.
 - **`SUMMARY.md`** alongside `SUMMARY.txt`, for pasting straight into your
   write-up notes.
 
+## Windows / Active Directory enumeration (Phase 3b)
+
+Triggered automatically — no flag needed — whenever any Kerberos (88),
+RPC (135), SMB (139/445), LDAP (389/636/3268/3269), RDP (3389), or WinRM
+(5985/5986) port is open. A "hard" CTF box is very often Windows/AD, and
+that needs a genuinely different playbook than the Linux/web one above:
+
+- **Surfaces what `-sC` already collected but was being thrown away.**
+  `smb-os-discovery`, `smb2-security-mode`, and `rdp-ntlm-info` all run by
+  default during Phase 2, but the tool previously only flag-scanned the
+  raw text and discarded everything else — including OS version, computer
+  name, domain, forest, FQDN, SMB signing status, and (via RDP NTLM) the
+  domain/hostname fingerprint. All of that is now parsed out and shown as
+  Quick Wins, at zero extra scan cost.
+- **SMB signing check** — if signing isn't enforced, flags it explicitly as
+  an SMB relay opportunity (`ntlmrelayx` + a coercion technique).
+- **MS17-010 (EternalBlue) safe-check** (`smb-vuln-ms17-010`) — a positive
+  hit is about as big a quick win as this tool can hand you.
+- **`smb-enum-shares`/`smb-enum-sessions`** — not in nmap's default script
+  category, run explicitly here.
+- **`rpcclient` anonymous/null-session enumeration** (`srvinfo`,
+  `enumdomusers`, `enumdomgroups`, `querydominfo`, `lsaquery`) — this often
+  succeeds even when `smbclient -L` share listing is denied, since it's a
+  different RPC pipe. A successful user list is pulled out and surfaced
+  directly — gold for password spraying or AS-REP roasting.
+- **`enum4linux-ng`** (optional, bonus pass) if installed.
+- **RDP encryption/NLA check** (`rdp-enum-encryption`).
+- **WinRM recognition** — `Microsoft HTTPAPI httpd` on 5985/5986 is WinRM's
+  generic banner, not a real web app; the tool now says so explicitly
+  instead of wasting a `--dirb-timeout`-sized chunk of the clock running
+  gobuster/nikto against it, and reminds you to try `evil-winrm`/`netexec`
+  with any creds found elsewhere — WinRM access is usually an instant shell.
+- **Names unknown dynamic RPC ports** (49152–65535, reported `unknown` by
+  `-sV`) via `msrpc-enum` instead of leaving them as a dead end — this is
+  the exact "port 49670/53559 unknown" situation from a real scan.
+
+New flags: `--no-windows` (skip this phase entirely) and
+`--windows-timeout` (default 180s, applies per sub-step).
+
+**Honesty about scope:** this is recon, not exploitation. On a genuinely
+hard box, actually retrieving a flag past this point means acting on what
+gets surfaced here — spraying the usernames rpcclient found, relaying NTLM
+if signing's off, running the EternalBlue exploit if flagged, trying
+WinRM with creds picked up elsewhere — not something a recon script can
+do for you safely or automatically. Validated by: confirmed `-sV`'s own
+`?` uncertainty marker and a clean match empirically on live services;
+unit-tested every NSE field-extraction regex against realistic nmap
+output (OS/domain/forest/FQDN, SMB signing lines, RDP NTLM fields,
+MS17-010 vulnerable/not-vulnerable text) and the `rpcclient` username
+regex against a realistic multi-user sample; integration-tested the full
+phase against real listening sockets on 445/3389/5985 to confirm every
+sub-step (SMB scripts, `rpcclient`, RDP script, WinRM recognition, the
+`.done` sentinel) runs and degrades gracefully with no crash when the
+protocol isn't actually spoken back. A live Samba/AD server wasn't
+spinnable in the sandbox this was built in (socket binding is restricted
+there), so full protocol-level behavior (e.g. real `smb-os-discovery`
+output, a genuine `rpcclient` user list) couldn't be exercised end-to-end
+— worth a first real run with `--windows-timeout` generous and an eye on
+the logs under `windows/`.
+
 ## Reliability fixes (round 3 — "quietly not doing what you think" bugs)
 
 These target a specific failure class: the tool *looking* like it worked
@@ -200,6 +260,8 @@ Full flag reference: `python3 ctf_assistant.py --help`
 | `--vhost-wordlist` | Wordlist for `--vhost` (small built-in default otherwise) |
 | `--no-http` / `--no-smb` / `--no-ftp` | Skip that phase entirely |
 | `-o/--output-dir` | Exact output directory instead of an auto timestamped one |
+| `--no-windows` | Skip the Windows/AD enumeration phase (Phase 3b) |
+| `--windows-timeout` | Per-sub-step timeout for Phase 3b (default 180) |
 | `--resume DIR` | Resume into an existing output dir, skipping finished phases |
 
 ## Output layout
@@ -225,7 +287,13 @@ ctf_results_<target>_<timestamp>/
 ├── loot/
 │   ├── ftp/                     # everything downloaded from anon FTP
 │   └── smb/<share>/             # everything downloaded from anon SMB
-└── *.done                       # completion sentinels (nmap/, http/, smb/, ftp/) —
+├── windows/                      # Phase 3b — Windows/AD enumeration
+│   ├── smb_scripts.nmap          # smb-enum-shares/sessions, smb-vuln-ms17-010
+│   ├── rpcclient_anon.txt        # anonymous/null-session rpcclient output
+│   ├── enum4linux-ng.txt         # if enum4linux-ng installed
+│   ├── rdp_scripts.nmap          # rdp-enum-encryption
+│   └── msrpc_enum_<port>.nmap    # per unknown dynamic RPC port
+└── *.done                       # completion sentinels (nmap/, http/, smb/, ftp/, windows/) —
                                   # --resume only trusts a phase if its sentinel exists
 ```
 

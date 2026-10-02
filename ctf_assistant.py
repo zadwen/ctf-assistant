@@ -273,12 +273,14 @@ CORE_TOOLS = {
 
 OPTIONAL_TOOLS = {
     "searchsploit": "Offline exploit-db lookup by detected service/version",
+    "rpcclient": "Anonymous/null-session MSRPC enumeration (ships with the smbclient package)",
+    "enum4linux-ng": "One-shot comprehensive SMB/AD null-session enumeration",
 }
 
 APT_PACKAGE_NAME = {
     "gobuster": "gobuster",
     "nikto": "nikto",
-    "smbclient": "smbclient",
+    "smbclient": "smbclient",  # also provides rpcclient
     "nmap": "nmap",
 }
 
@@ -330,7 +332,15 @@ def print_tool_checklist(status: dict[str, bool]) -> None:
     if not status.get("searchsploit", False):
         out("  Tip: install searchsploit for offline exploit-db lookups "
             "(git clone https://gitlab.com/exploit-database/exploitdb, "
-            "or included by default on Kali).\n", "bright_black")
+            "or included by default on Kali).", "bright_black")
+    if not status.get("rpcclient", False):
+        out("  Tip: rpcclient (anonymous MSRPC enumeration against Windows/AD "
+            "targets) ships with the smbclient package — install that and "
+            "you get both.", "bright_black")
+    if not status.get("enum4linux-ng", False):
+        out("  Tip: install enum4linux-ng for one-shot comprehensive SMB/AD "
+            "null-session enumeration (pip install enum4linux-ng).", "bright_black")
+    out("", "")
 
 
 # ==========================================================================
@@ -658,6 +668,22 @@ FTP_PORTS = {21}
 HTTP_SERVICE_NAMES = {"http", "https", "http-proxy", "http-alt", "ssl/http"}
 SMB_SERVICE_NAMES = {"microsoft-ds", "netbios-ssn", "smb"}
 FTP_SERVICE_NAMES = {"ftp"}
+
+# Windows/AD-related ports — any of these present triggers the dedicated
+# Windows/AD enumeration phase (phase_windows_ad_enum), since these boxes
+# need a genuinely different playbook than a Linux/web CTF target.
+KERBEROS_PORTS = {88}
+RPC_PORT = 135
+SMB_RELATED_PORTS = {139, 445}
+LDAP_PORTS = {389, 636, 3268, 3269}
+RDP_PORTS = {3389}
+WINRM_PORTS = {5985, 5986}
+WINDOWS_TRIGGER_PORTS = (KERBEROS_PORTS | {RPC_PORT} | SMB_RELATED_PORTS | LDAP_PORTS
+                          | RDP_PORTS | WINRM_PORTS)
+# Windows' ephemeral/dynamic RPC endpoint range — ports here reported as
+# "unknown" are worth a targeted msrpc-enum pass to name what's actually
+# listening instead of leaving them as a dead end.
+WINDOWS_DYNAMIC_RPC_RANGE = range(49152, 65536)
 
 # Candidate wordlist locations, in preference order. The Kali convention
 # (/usr/share/wordlists/dirb/common.txt) is checked first since it's the
@@ -1083,6 +1109,34 @@ def parse_smb_shares(output: str) -> list[str]:
     return shares
 
 
+# --------------------------------------------------------------------------
+# NSE (nmap scripting engine) output parsing — shared by phase_windows_ad_enum.
+# nmap's -oN text format nests a script's output under a "| script-name:"
+# header, with continuation lines prefixed "|   " and the final line of a
+# block prefixed "|_  ". These helpers strip that prefix so plain "Label:
+# value" extraction works regardless of which script produced the line —
+# which also means fields already collected by -sC's default-category
+# scripts (smb-os-discovery, smb2-security-mode, rdp-ntlm-info all run by
+# default) get surfaced from the existing deep-scan log for free, with zero
+# extra scan time, instead of being silently discarded the way they were
+# before this only flag-scanned the raw text.
+# --------------------------------------------------------------------------
+
+def _clean_nse_lines(text: str) -> list[str]:
+    return [re.sub(r"^\|[_]?\s*", "", line) for line in text.splitlines()]
+
+
+def extract_nse_field(text: str, label: str) -> Optional[str]:
+    """First 'label: value' match (case-insensitive) after stripping NSE
+    line prefixes. Returns None if the label never appears."""
+    pattern = re.compile(rf"^\s*{re.escape(label)}:\s*(.+?)\s*$", re.IGNORECASE)
+    for line in _clean_nse_lines(text):
+        m = pattern.match(line)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
 def phase_smb_loot(ctx: ScanContext, share: str) -> bool:
     """Attempt to anonymously download files from an SMB share and flag-scan
     them. Returns False if the download hit its timeout (loot may be
@@ -1311,11 +1365,242 @@ def phase_ftp_enum(ctx: ScanContext, port: OpenPort) -> None:
             f"enumeration complete; --resume will re-run it.)", "bright_black")
 
 
+# ==========================================================================
+# Phase 3b — Windows / Active Directory enumeration
+# ==========================================================================
+# Triggers automatically whenever a Kerberos/RPC/SMB/LDAP/RDP/WinRM port is
+# open — a "hard" CTF box is very often a Windows or AD target, and that
+# needs a genuinely different playbook than the Linux/web one above:
+# domain/OS fingerprinting, SMB signing (relay potential), MS17-010
+# (EternalBlue), anonymous RPC/null-session user enumeration, and correctly
+# recognizing WinRM instead of wasting a dirb run against its generic
+# 'Microsoft HTTPAPI httpd' banner.
+
+def phase_windows_ad_enum(ctx: ScanContext, tool_status: dict[str, bool],
+                           timeout: int = 180, resume: bool = False) -> None:
+    relevant_ports = [p for p in ctx.open_ports if p.port in WINDOWS_TRIGGER_PORTS]
+    if not relevant_ports:
+        return
+
+    win_out_dir = ctx.output_dir / "windows"
+    marker = win_out_dir / "windows.done"
+    if resume and phase_is_done(marker):
+        out(f"  [resume] Windows/AD enumeration already complete (found {marker}) — skipping.",
+            "blue")
+        return
+
+    section("Phase 3b — Windows / Active Directory Enumeration")
+    phase_complete = True
+    smb_ports_open = [p.port for p in ctx.open_ports if p.port in SMB_RELATED_PORTS]
+
+    # 1. Surface fields -sC's DEFAULT-category scripts already collected
+    #    (smb-os-discovery, smb2-security-mode, rdp-ntlm-info are all
+    #    default+safe) but which were previously discarded — this costs
+    #    zero extra scan time, it's pure parsing of what Phase 2 already ran.
+    deep_scan_log = ctx.output_dir / "nmap" / "deep_scan.nmap"
+    existing_text = deep_scan_log.read_text(errors="replace") if deep_scan_log.exists() else ""
+
+    os_str = extract_nse_field(existing_text, "OS")
+    computer = extract_nse_field(existing_text, "Computer name")
+    domain = extract_nse_field(existing_text, "Domain name")
+    forest = extract_nse_field(existing_text, "Forest name")
+    fqdn = extract_nse_field(existing_text, "FQDN")
+    if os_str or computer or domain:
+        parts = []
+        if os_str:
+            parts.append(f"OS={os_str}")
+        if computer:
+            parts.append(f"Computer={computer}")
+        if domain:
+            parts.append(f"Domain={domain}")
+        if forest and forest != domain:
+            parts.append(f"Forest={forest}")
+        if fqdn:
+            parts.append(f"FQDN={fqdn}")
+        msg = "Windows host fingerprint (SMB): " + ", ".join(parts)
+        out(f"    {msg}", "green", bold=True)
+        ctx.quick_wins.append(msg)
+        if os_str and tool_status.get("searchsploit"):
+            searchsploit_lookup(ctx, OpenPort(port=445, service="smb-os", version=os_str), tool_status)
+
+    sign_line = next((ln for ln in _clean_nse_lines(existing_text)
+                       if "message signing" in ln.lower()), None)
+    if sign_line:
+        risky = "not required" in sign_line.lower() or "disabled" in sign_line.lower()
+        out(f"    SMB signing: {sign_line}", "yellow" if risky else "green")
+        if risky:
+            ctx.quick_wins.append(
+                f"SMB signing is NOT enforced ({sign_line}) — vulnerable to SMB relay "
+                f"(ntlmrelayx). Worth it if you can coerce auth (PetitPotam, PrinterBug, "
+                f"coercer) from another angle."
+            )
+
+    ntlm_fields = {}
+    for label in ("Target_Name", "NetBIOS_Domain_Name", "NetBIOS_Computer_Name",
+                  "DNS_Domain_Name", "DNS_Computer_Name", "DNS_Tree_Name", "Product_Version"):
+        val = extract_nse_field(existing_text, label)
+        if val:
+            ntlm_fields[label] = val
+    if ntlm_fields:
+        msg = "RDP NTLM fingerprint: " + ", ".join(f"{k}={v}" for k, v in ntlm_fields.items())
+        out(f"    {msg}", "green", bold=True)
+        ctx.quick_wins.append(msg)
+
+    # 2. Targeted scripts NOT in the default category: share/session
+    #    enumeration and the MS17-010 (EternalBlue) safe-check.
+    if smb_ports_open:
+        port_list = ",".join(str(p) for p in smb_ports_open)
+        log_path = win_out_dir / "smb_scripts.nmap"
+        cmd = [
+            "nmap", "-Pn", "-p", port_list,
+            "--script", "smb-enum-shares,smb-enum-sessions,smb-vuln-ms17-010",
+            "-oN", str(log_path), ctx.target,
+        ]
+        rc, output = spinner_run("Running targeted SMB enum/vuln scripts...", cmd, log_path,
+                                  timeout=timeout)
+        if rc == 124:
+            phase_complete = False
+            out(f"    [!] SMB script scan hit its {timeout}s timeout — results may be incomplete.",
+                "yellow", bold=True)
+            ctx.recommendations.append(
+                f"SMB targeted script scan timed out after {timeout}s — re-run with a higher "
+                f"--windows-timeout."
+            )
+        elif rc == 127:
+            out("    nmap not installed — skipping.", "red")
+        else:
+            record_flags(ctx, output, "nmap SMB enum/vuln scripts")
+            if re.search(r"state:\s*vulnerable", output, re.IGNORECASE):
+                out("    [!!!] VULNERABLE TO MS17-010 (EternalBlue)!", "red", bold=True)
+                ctx.quick_wins.append(
+                    f"Port 445: VULNERABLE to MS17-010 (EternalBlue) — see {log_path}. Near-"
+                    f"certain SYSTEM path: metasploit exploit/windows/smb/ms17_010_eternalblue, "
+                    f"or a public standalone PoC."
+                )
+            nse_shares = [ln.strip() for ln in _clean_nse_lines(output)
+                          if re.match(r"^[A-Za-z0-9_$.\- ]+\s+(Disk|IPC|Printer)\b", ln.strip())]
+            if nse_shares:
+                out(f"    Shares (via NSE enum): {'; '.join(nse_shares[:10])}", "green")
+            out(f"    SMB scripts log: {log_path}", "green")
+
+    # 3. rpcclient anonymous/null-session enumeration — often works even
+    #    when smbclient -L share listing is denied, since it's a different
+    #    RPC pipe (lsarpc/samr) rather than the file-sharing surface.
+    if smb_ports_open and tool_status.get("rpcclient"):
+        log_path = win_out_dir / "rpcclient_anon.txt"
+        cmd = [
+            "rpcclient", "-U", "", "-N", "-c",
+            "srvinfo;enumdomusers;enumdomgroups;querydominfo;lsaquery", ctx.target,
+        ]
+        rc, output = spinner_run("rpcclient anonymous/null-session enumeration...",
+                                  cmd, log_path, timeout=30)
+        if rc == 124:
+            phase_complete = False
+            out("    [!] rpcclient timed out.", "yellow")
+        else:
+            record_flags(ctx, output, "rpcclient null session")
+            if output.strip() and "NT_STATUS_ACCESS_DENIED" not in output and rc != 127:
+                users = re.findall(r"user:\[(.*?)\]", output)
+                if users:
+                    out(f"    [!] Null-session RPC enumeration SUCCEEDED — {len(users)} "
+                        f"user(s) found!", "magenta", bold=True)
+                    shown = ", ".join(users[:20]) + ("..." if len(users) > 20 else "")
+                    ctx.quick_wins.append(
+                        f"rpcclient null session enumerated {len(users)} domain user(s): "
+                        f"{shown} — gold for password spraying / AS-REP roasting. "
+                        f"See {log_path}."
+                    )
+                else:
+                    out("    rpcclient null session connected but returned no usable "
+                        "enumeration data.", "yellow")
+            elif rc == 127:
+                pass  # tool missing, already noted in checklist
+            else:
+                out("    rpcclient null session denied (expected on a hardened box).", "yellow")
+
+    # 4. enum4linux-ng, if installed — comprehensive bonus pass.
+    if smb_ports_open and tool_status.get("enum4linux-ng"):
+        log_path = win_out_dir / "enum4linux-ng.txt"
+        cmd = ["enum4linux-ng", "-A", ctx.target]
+        rc, output = spinner_run("enum4linux-ng full enumeration...", cmd, log_path,
+                                  timeout=max(timeout, 180))
+        if rc == 124:
+            phase_complete = False
+            out("    [!] enum4linux-ng hit its timeout — results may be incomplete.", "yellow")
+        elif rc != 127:
+            record_flags(ctx, output, "enum4linux-ng")
+            out(f"    enum4linux-ng log: {log_path}", "green")
+
+    # 5. RDP-specific script not in the default category (encryption/NLA level).
+    rdp_open = [p.port for p in ctx.open_ports if p.port in RDP_PORTS]
+    if rdp_open:
+        log_path = win_out_dir / "rdp_scripts.nmap"
+        cmd = ["nmap", "-Pn", "-p", "3389", "--script", "rdp-enum-encryption",
+               "-oN", str(log_path), ctx.target]
+        rc, output = spinner_run("Checking RDP encryption/NLA settings...", cmd, log_path,
+                                  timeout=60)
+        if rc == 124:
+            phase_complete = False
+        elif rc != 127:
+            record_flags(ctx, output, "nmap rdp-enum-encryption")
+            out(f"    RDP encryption scan log: {log_path}", "green")
+
+    # 6. WinRM recognition — 'Microsoft HTTPAPI httpd' on 5985/5986 is
+    #    WinRM's standard banner, not a real web app; running gobuster/nikto
+    #    against it (which the HTTP phase would otherwise do, since these
+    #    ports are in HTTP_PORTS) wastes the clock on a dead end.
+    winrm_open = [p for p in ctx.open_ports if p.port in WINRM_PORTS]
+    if winrm_open:
+        ports_str = "/".join(str(p.port) for p in winrm_open)
+        out(f"    Port(s) {ports_str}: this is WinRM, not a real web app — "
+            f"gobuster/nikto against it won't find anything.", "cyan", bold=True)
+        ctx.quick_wins.append(
+            f"Port(s) {ports_str}: WinRM is enabled. Once you have ANY valid creds "
+            f"(even low-priv/service account): evil-winrm -i {ctx.target} -u USER -p PASS "
+            f"or netexec winrm {ctx.target} -u USER -p PASS. Try spraying creds found "
+            f"elsewhere (SMB shares, a web app, etc.) here first — WinRM access is "
+            f"usually an instant shell."
+        )
+
+    # 7. Name unknown dynamic RPC ports instead of leaving them as dead ends —
+    #    this is exactly the 'port 49670/53559 unknown' situation from a
+    #    real run against this tool.
+    unknown_high_ports = [
+        p for p in ctx.open_ports
+        if p.port in WINDOWS_DYNAMIC_RPC_RANGE and p.service.strip("?").lower() in ("unknown", "msrpc", "")
+    ]
+    if unknown_high_ports and (RPC_PORT in [p.port for p in ctx.open_ports] or smb_ports_open):
+        for p in unknown_high_ports[:5]:  # cap — these are slow one-port-at-a-time scans
+            log_path = win_out_dir / f"msrpc_enum_{p.port}.nmap"
+            cmd = ["nmap", "-Pn", "-p", str(p.port), "--script", "msrpc-enum",
+                   "-oN", str(log_path), ctx.target]
+            rc, output = spinner_run(f"Identifying RPC service on port {p.port}...",
+                                      cmd, log_path, timeout=30)
+            if rc == 124:
+                phase_complete = False
+                continue
+            if rc == 127:
+                break
+            record_flags(ctx, output, f"msrpc-enum port {p.port}")
+            interface_lines = [ln.strip() for ln in output.splitlines()
+                                if re.search(r"uuid|interface", ln, re.IGNORECASE) and "nmap" not in ln.lower()]
+            if interface_lines:
+                out(f"    Port {p.port} RPC interface(s): {'; '.join(interface_lines[:3])}", "green")
+                ctx.quick_wins.append(f"Port {p.port}: named via msrpc-enum — see {log_path}")
+
+    if phase_complete:
+        mark_done(marker)
+    else:
+        out("    (A sub-step timed out — not marking Windows/AD enumeration complete; "
+            "--resume will re-run it.)", "bright_black")
+
+
 def phase_service_enum(ctx: ScanContext, tool_status: dict[str, bool], thorough: bool,
                         wordlist_override: Optional[str] = None, dirb_timeout: int = 300,
                         nikto_timeout: int = 150, vhost: bool = False,
                         vhost_domain: Optional[str] = None, vhost_wordlist: Optional[str] = None,
-                        resume: bool = False) -> None:
+                        resume: bool = False, no_windows: bool = False,
+                        windows_timeout: int = 180) -> None:
     section("Phase 3 — Service-Specific Enumeration")
     if not ctx.open_ports:
         out("  Skipped — no open ports to enumerate.", "yellow")
@@ -1361,6 +1646,9 @@ def phase_service_enum(ctx: ScanContext, tool_status: dict[str, bool], thorough:
 
     if not matched_any:
         out("  No HTTP/SMB/FTP ports among open ports — nothing to auto-enumerate here.", "yellow")
+
+    if not no_windows:
+        phase_windows_ad_enum(ctx, tool_status, timeout=windows_timeout, resume=resume)
 
 
 # ==========================================================================
@@ -1717,6 +2005,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-http", action="store_true", help="Skip HTTP/HTTPS enumeration in Phase 3.")
     p.add_argument("--no-smb", action="store_true", help="Skip SMB enumeration in Phase 3.")
     p.add_argument("--no-ftp", action="store_true", help="Skip FTP enumeration in Phase 3.")
+    p.add_argument("--no-windows", action="store_true",
+                    help="Skip the Windows/AD enumeration phase (auto-triggered by any "
+                         "Kerberos/RPC/SMB/LDAP/RDP/WinRM port — Phase 3b).")
+    p.add_argument("--windows-timeout", type=int, default=180,
+                    help="Timeout in seconds for each Windows/AD enumeration sub-step "
+                         "(SMB scripts, enum4linux-ng, etc.) (default: 180).")
     p.add_argument("-o", "--output-dir", help="Use this exact output directory instead of "
                                                "auto-generating a timestamped one.")
     p.add_argument("--resume", metavar="DIR",
@@ -1824,7 +2118,8 @@ def main() -> int:
         ctx.open_ports = filtered
         phase_service_enum(ctx, ctx.tool_status, args.thorough, args.wordlist, args.dirb_timeout,
                             args.nikto_timeout, args.vhost, args.vhost_domain, args.vhost_wordlist,
-                            resume=resume_mode)
+                            resume=resume_mode, no_windows=args.no_windows,
+                            windows_timeout=args.windows_timeout)
         ctx.open_ports = original_ports
 
         build_recommendations(ctx)
