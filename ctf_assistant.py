@@ -48,6 +48,10 @@ import csv
 import ftplib
 import io
 import ipaddress
+import json
+import hashlib
+from urllib.parse import urljoin, urlsplit
+from ctf_evidence import (detect, ArtifactScanner, merge_findings, parse_nmap, write_json_report)
 import re
 import shutil
 import socket
@@ -87,13 +91,13 @@ except ImportError:
 
 
 # ==========================================================================
-# core/branding.py equivalent — kept inline here for a single-file deliverable
+# Branding — evidence analysis lives in ctf_evidence.py
 # ==========================================================================
 
 class Brand:
     NAME = "CTF Recon Assistant"
     AUTHOR = "zadwen"
-    VERSION = "2.0.0"
+    VERSION = "2.1.0"
     REPO = "github.com/zadwen/ctf-assistant"
 
     BANNER = r"""
@@ -190,11 +194,10 @@ def flag_scan(text: str) -> list[str]:
 
 def record_flags(ctx: "ScanContext", text: str, source: str) -> list[str]:
     """Scan text for flags, record any new ones on ctx, return what was found."""
-    found = flag_scan(text)
-    for f in found:
-        if (f, source) not in ctx.flags_found:
-            ctx.flags_found.append((f, source))
-    return found
+    findings = detect(text, source, ctx.flag_prefixes, ctx.include_hashes)
+    merge_findings(ctx, findings)
+    return list(dict.fromkeys(f['value'] for f in findings if f['confidence'] != 'low'))
+
 
 
 def filename_is_interesting(name: str) -> bool:
@@ -211,6 +214,7 @@ class OpenPort:
     protocol: str = "tcp"
     service: str = ""
     version: str = ""
+    state: str = "open"
 
 
 @dataclass
@@ -223,6 +227,10 @@ class ScanContext:
     quick_wins: list[str] = field(default_factory=list)
     flags_found: list[tuple[str, str]] = field(default_factory=list)  # (flag, source)
     exploit_hits: list[str] = field(default_factory=list)
+    flag_evidence: list[dict] = field(default_factory=list)
+    analysis_warnings: list[str] = field(default_factory=list)
+    flag_prefixes: list[str] = field(default_factory=list)
+    include_hashes: bool = False
 
 
 # ==========================================================================
@@ -377,6 +385,7 @@ def run_command(cmd: list[str], log_path: Path, timeout: Optional[int] = None,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8", errors="replace",
             timeout=timeout,
             cwd=str(cwd) if cwd else None,
         )
@@ -388,7 +397,7 @@ def run_command(cmd: list[str], log_path: Path, timeout: Optional[int] = None,
         log_path.write_text(msg)
         return 127, msg
     except subprocess.TimeoutExpired as e:
-        partial = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        partial = e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         msg = partial + f"\n[ERROR] Command timed out after {timeout}s: {' '.join(cmd)}"
         log_path.write_text(msg)
         return 124, msg
@@ -434,6 +443,7 @@ def phase_quick_scan(ctx: ScanContext, fast: bool = False, min_rate: int = 1000)
         "-Pn",              # skip host discovery — CTF boxes often block ICMP
         "--open",
         "-oN", str(log_path.with_suffix(".nmap")),
+        "-oX", str(log_path.with_suffix(".xml")),
         ctx.target,
     ]
     label = "top 1000 ports (--fast)" if fast else "all 65535 ports"
@@ -475,6 +485,7 @@ def phase_udp_scan(ctx: ScanContext, top_ports: int = 50) -> None:
     cmd = [
         "nmap", "-sU", "-Pn", "--top-ports", str(top_ports),
         "-oN", str(log_path.with_suffix(".nmap")),
+        "-oX", str(log_path.with_suffix(".xml")),
         ctx.target,
     ]
     out(f"  Running: {' '.join(cmd)}", "bright_black")
@@ -497,7 +508,7 @@ def phase_udp_scan(ctx: ScanContext, top_ports: int = 50) -> None:
             service = m.group(3)
             found.append(port_num)
             if not any(p.port == port_num and p.protocol == "udp" for p in ctx.open_ports):
-                ctx.open_ports.append(OpenPort(port_num, "udp", service))
+                ctx.open_ports.append(OpenPort(port_num, "udp", service, state=m.group(2)))
 
     if found:
         out(f"  UDP ports open/open|filtered: {', '.join(str(p) for p in found)}", "green", bold=True)
@@ -525,7 +536,7 @@ def _apply_deep_scan_output(ctx: ScanContext, output: str) -> None:
             proto = m.group(2)
             service = m.group(3)
             version = m.group(4).strip()
-            existing = next((p for p in ctx.open_ports if p.port == port_num), None)
+            existing = next((p for p in ctx.open_ports if p.port == port_num and p.protocol == proto), None)
             if existing:
                 existing.service = service
                 existing.version = version
@@ -553,6 +564,7 @@ def phase_deep_scan(ctx: ScanContext, ports: list[int]) -> None:
         "-Pn",
         "-p", port_list,
         "-oN", str(log_path.with_suffix(".nmap")),
+        "-oX", str(log_path.with_suffix(".xml")),
         ctx.target,
     ]
     out(f"  Running: {' '.join(cmd)}", "bright_black")
@@ -581,7 +593,7 @@ def resume_load_quick_scan(ctx: ScanContext) -> Optional[list[int]]:
     partial port list."""
     marker = ctx.output_dir / "nmap" / "quick_scan.done"
     log_path = ctx.output_dir / "nmap" / "quick_scan.nmap"
-    if not phase_is_done(marker):
+    if not phase_is_done(marker) or not log_path.is_file():
         if log_path.exists():
             out(f"  [resume] Found {log_path} but no completion marker — "
                 f"it looks like that scan was interrupted. Re-running Phase 1 "
@@ -606,7 +618,7 @@ def resume_load_deep_scan(ctx: ScanContext) -> bool:
     interrupted/failed, so it's correctly re-run rather than trusted."""
     marker = ctx.output_dir / "nmap" / "deep_scan.done"
     log_path = ctx.output_dir / "nmap" / "deep_scan.nmap"
-    if not phase_is_done(marker):
+    if not phase_is_done(marker) or not log_path.is_file():
         if log_path.exists():
             out(f"  [resume] Found {log_path} but no completion marker — "
                 f"re-running Phase 2 rather than trusting a possibly-partial "
@@ -733,6 +745,18 @@ def find_wordlist(thorough: bool = False, override: Optional[str] = None) -> Opt
     return None
 
 
+class SameOriginRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if url_origin(req.full_url) != url_origin(newurl):
+            raise urllib.error.HTTPError(newurl, code, "Cross-origin redirect blocked", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def url_origin(url):
+    parsed = urlsplit(url)
+    return parsed.scheme.lower(), parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+
+
 def safe_fetch(url: str, timeout: int = 6) -> Optional[tuple[int, str]]:
     """GET a URL, ignoring TLS cert errors (common on CTF self-signed certs).
     Returns (status_code, text) on any HTTP response, or None on network
@@ -742,7 +766,8 @@ def safe_fetch(url: str, timeout: int = 6) -> Optional[tuple[int, str]]:
     ctx_ssl.verify_mode = ssl.CERT_NONE
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (ctf-assistant)"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx_ssl) as resp:
+        opener = urllib.request.build_opener(SameOriginRedirect(), urllib.request.HTTPSHandler(context=ctx_ssl))
+        with opener.open(req, timeout=timeout) as resp:
             body = resp.read(MAX_LOOT_FILE_BYTES)
             text = body.decode("utf-8", errors="replace")
             return resp.status, text
@@ -813,8 +838,13 @@ def auto_fetch_and_scan(ctx: ScanContext, base_url: str, paths: list[str],
     targets)."""
     fetched: list[tuple[str, str]] = []
     for rel_path in paths[:MAX_AUTO_FETCHED_PATHS]:
-        rel_path = rel_path.lstrip("/")
-        url = base_url + rel_path if not rel_path.startswith("http") else rel_path
+        url = urljoin(base_url, rel_path)
+        try:
+            if url_origin(url) != url_origin(base_url) or urlsplit(url).username:
+                ctx.analysis_warnings.append(f"Skipped out-of-origin discovery: {url}")
+                continue
+        except ValueError:
+            continue
         result = safe_fetch(url)
         if result is None:
             continue
@@ -822,7 +852,7 @@ def auto_fetch_and_scan(ctx: ScanContext, base_url: str, paths: list[str],
         if status != 200 or not text.strip():
             continue
 
-        safe_name = re.sub(r"[^\w.-]", "_", rel_path) or "root"
+        safe_name = (re.sub(r"[^\w.-]", "_", rel_path)[:100] or "root") + "_" + hashlib.sha256(url.encode()).hexdigest()[:12]
         save_path = out_dir / f"fetched_{safe_name}.txt"
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_path.write_text(text[:MAX_LOOT_FILE_BYTES])
@@ -831,7 +861,7 @@ def auto_fetch_and_scan(ctx: ScanContext, base_url: str, paths: list[str],
         new_flags = record_flags(ctx, text, f"HTTP GET {url}")
         if new_flags:
             for f in new_flags:
-                out(f"    [!] FLAG FOUND at {url}: {f}", "magenta", bold=True)
+                out(f"    [!] FLAG CANDIDATE at {url}: {f}", "magenta", bold=True)
                 ctx.quick_wins.append(f"Flag at {url}: {f}")
         elif filename_is_interesting(Path(rel_path).name):
             out(f"    [i] Interesting file accessible (200 OK): {url}", "cyan")
@@ -1141,6 +1171,9 @@ def phase_smb_loot(ctx: ScanContext, share: str) -> bool:
     """Attempt to anonymously download files from an SMB share and flag-scan
     them. Returns False if the download hit its timeout (loot may be
     incomplete) so the caller can decide whether --resume should trust it."""
+    if share in {"", ".", ".."} or any(c in share for c in "/\\\r\n"):
+        ctx.analysis_warnings.append(f"Skipped unsafe SMB share name: {share!r}")
+        return False
     loot_dir = ctx.output_dir / "loot" / "smb" / share
     loot_dir.mkdir(parents=True, exist_ok=True)
     cmd = [
@@ -1155,7 +1188,7 @@ def phase_smb_loot(ctx: ScanContext, share: str) -> bool:
     files_only = [f for f in downloaded if f.is_file()]
     if not files_only:
         out(f"    No files downloaded from '{share}' (empty or access issue).", "yellow")
-        return rc != 124
+        return rc == 0
 
     out(f"    Downloaded {len(files_only)} file(s) from '{share}' -> {loot_dir}", "green")
     if rc == 124:
@@ -1174,11 +1207,11 @@ def phase_smb_loot(ctx: ScanContext, share: str) -> bool:
                 content = f.read_text(errors="replace")
                 new_flags = record_flags(ctx, content, f"SMB share '{share}' file {f.name}")
                 for flag in new_flags:
-                    out(f"    [!] FLAG FOUND in {f}: {flag}", "magenta", bold=True)
+                    out(f"    [!] FLAG CANDIDATE in {f}: {flag}", "magenta", bold=True)
                     ctx.quick_wins.append(f"Flag in SMB file {f}: {flag}")
         except (UnicodeDecodeError, OSError):
             pass  # binary file — not flag-scannable as text, still downloaded for manual review
-    return rc != 124
+    return rc == 0
 
 
 def phase_smb_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, bool]) -> None:
@@ -1252,6 +1285,12 @@ def _ftp_walk(ftp: ftplib.FTP, remote_dir: str, loot_dir: Path, ctx: ScanContext
         if downloaded >= max_files:
             break
         remote_path = f"{remote_dir}/{name}".lstrip("/") if remote_dir else name
+        if "\r" in remote_path or "\n" in remote_path or "\\" in remote_path:
+            continue
+        candidate_path = (loot_dir / remote_path).resolve()
+        if not candidate_path.is_relative_to(loot_dir.resolve()):
+            ctx.analysis_warnings.append(f"Skipped escaping FTP path: {remote_path}")
+            continue
         entry_type = facts.get("type", "file")
 
         if entry_type == "dir":
@@ -1271,7 +1310,11 @@ def _ftp_walk(ftp: ftplib.FTP, remote_dir: str, loot_dir: Path, ctx: ScanContext
         local_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             buf = io.BytesIO()
-            ftp.retrbinary(f"RETR {remote_path}", buf.write)
+            def limited_write(chunk):
+                if buf.tell() + len(chunk) > MAX_LOOT_FILE_BYTES:
+                    raise ValueError("FTP file exceeds download limit")
+                buf.write(chunk)
+            ftp.retrbinary(f"RETR {remote_path}", limited_write)
             data = buf.getvalue()
             local_path.write_bytes(data)
             downloaded += 1
@@ -1284,7 +1327,7 @@ def _ftp_walk(ftp: ftplib.FTP, remote_dir: str, loot_dir: Path, ctx: ScanContext
                 text = data.decode("utf-8", errors="replace")
                 new_flags = record_flags(ctx, text, f"FTP file {remote_path}")
                 for flag in new_flags:
-                    out(f"    [!] FLAG FOUND in {remote_path}: {flag}", "magenta", bold=True)
+                    out(f"    [!] FLAG CANDIDATE in {remote_path}: {flag}", "magenta", bold=True)
                     ctx.quick_wins.append(f"Flag in FTP file {remote_path}: {flag}")
             except Exception:
                 pass
@@ -1801,26 +1844,10 @@ def print_port_summary(ctx: ScanContext) -> None:
 # ==========================================================================
 
 def final_flag_sweep(ctx: ScanContext) -> None:
-    """Re-scan every text file under the output directory for flags, in case
-    something was written to disk without going through record_flags (e.g. a
-    raw nmap script output, or a log we didn't specifically parse)."""
-    for path in ctx.output_dir.rglob("*"):
-        if not path.is_file():
-            continue
-        try:
-            if path.stat().st_size > MAX_LOOT_FILE_BYTES:
-                continue
-        except OSError:
-            continue
-        try:
-            text = path.read_text(errors="replace")
-        except Exception:
-            continue
-        source = f"file: {path.relative_to(ctx.output_dir)}"
-        found = flag_scan(text)
-        for f in found:
-            if not any(existing_f == f for existing_f, _ in ctx.flags_found):
-                ctx.flags_found.append((f, source))
+    """Analyze collected artifacts, including bounded archive/encoding support."""
+    scanner = ArtifactScanner(ctx.flag_prefixes, ctx.include_hashes)
+    merge_findings(ctx, scanner.scan([ctx.output_dir]))
+    ctx.analysis_warnings.extend(scanner.warnings)
 
 
 # ==========================================================================
@@ -1892,7 +1919,7 @@ def write_final_report(ctx: ScanContext) -> Path:
         f"Target: {ctx.target}",
         f"Generated: {datetime.now().isoformat()}",
         "",
-        "=== FLAGS FOUND ===" if ctx.flags_found else "=== FLAGS FOUND: none yet ===",
+        "=== FLAG CANDIDATES (unverified) ===" if ctx.flags_found else "=== FLAG CANDIDATES: none yet ===",
     ]
     for flag, src in ctx.flags_found:
         lines.append(f"  {flag}   <-  {src}")
@@ -1908,8 +1935,11 @@ def write_final_report(ctx: ScanContext) -> Path:
     lines.append("=== Recommendations ===")
     for i, rec in enumerate(ctx.recommendations, 1):
         lines.append(f"  [{i}] {rec}")
+    lines.extend(["", "=== Analysis warnings ===", *dict.fromkeys(ctx.analysis_warnings),
+                  "", "All candidates, confidence and decoding provenance: REPORT.json"])
     report_path.write_text("\n".join(lines))
     write_markdown_report(ctx)
+    write_json_report(ctx, Brand.VERSION)
     return report_path
 
 
@@ -1922,7 +1952,7 @@ def write_markdown_report(ctx: ScanContext) -> Path:
         "",
         f"*Generated: {datetime.now().isoformat()}*",
         "",
-        "## 🚩 Flags found",
+        "## Flag candidates (unverified)",
         "",
     ]
     if ctx.flags_found:
@@ -1955,6 +1985,15 @@ def write_markdown_report(ctx: ScanContext) -> Path:
     lines.append("")
     for i, rec in enumerate(ctx.recommendations, 1):
         lines.append(f"{i}. {rec}")
+    def cell(value):
+        return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("|", "&#124;").replace("`", "&#96;").replace("\n", " ").replace("\r", " ")
+    lines.extend(["", "## Candidate evidence", "", "All matches are unverified. Line numbers refer to the decoded text when a transformation was applied.", "",
+                  "| Candidate | Confidence | Source | Transformation | Line |",
+                  "|---|---|---|---|---|"])
+    for finding in sorted(ctx.flag_evidence, key=lambda f: {"high": 0, "medium": 1, "low": 2}[f["confidence"]]):
+        lines.append("| " + " | ".join(cell(finding[k]) for k in ("value", "confidence", "source", "transform", "line")) + " |")
+    if ctx.analysis_warnings:
+        lines.extend(["", "## Analysis warnings", ""] + ["- " + cell(w) for w in dict.fromkeys(ctx.analysis_warnings)])
     md_path.write_text("\n".join(lines))
     return md_path
 
@@ -1977,7 +2016,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Phase 1 scans only the top 1000 ports instead of all 65535 — much "
                          "faster, at the risk of missing a service on an unusual port.")
     p.add_argument("--min-rate", type=int, default=1000,
-                    help="Nmap --min-rate for Phase 1/2 (default: 1000). Lower this (e.g. 300) "
+                    help="Nmap --min-rate for Phase 1 (default: 1000). Lower this (e.g. 300) "
                          "on lossy CTF VPNs (HTB/THM) if you're seeing inconsistent results or "
                          "ports that come and go between runs.")
     p.add_argument("--udp", action="store_true",
@@ -2017,6 +2056,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                     help="Resume into an existing output directory: phases whose log files "
                          "already exist and look complete are skipped instead of re-run. "
                          "Use this after a Ctrl+C instead of starting over from scratch.")
+    p.add_argument("--analyze", nargs="+", metavar="PATH", help="Offline analysis of files/directories/ZIP/GZIP; no network access.")
+    p.add_argument("--import-nmap", metavar="XML", help="Offline import of an Nmap -oX file; combine with --analyze.")
+    p.add_argument("--flag-prefix", action="append", default=[], help="Recognize an additional event prefix; repeatable (e.g. --flag-prefix MYCTF).")
+    p.add_argument("--include-hashes", action="store_true", help="Include unlabelled 32-hex strings as low-confidence evidence in REPORT.json.")
+    p.add_argument("--version", action="version", version=Brand.VERSION)
     return p
 
 
@@ -2025,7 +2069,52 @@ def build_arg_parser() -> argparse.ArgumentParser:
 # ==========================================================================
 
 def main() -> int:
-    args = build_arg_parser().parse_args()
+    parser = build_arg_parser()
+    args = parser.parse_args()
+    for name in ("min_rate", "udp_top_ports", "dirb_timeout", "nikto_timeout", "windows_timeout"):
+        if getattr(args, name) <= 0:
+            parser.error(f"--{name.replace('_', '-')} must be positive")
+    if args.udp_top_ports > 65535:
+        parser.error("--udp-top-ports must be <= 65535")
+    if any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", prefix) for prefix in args.flag_prefix):
+        parser.error("Flag prefixes must be 1–32 letters/digits/underscores, beginning with a letter")
+    if args.ports:
+        try:
+            parsed_ports = list(dict.fromkeys(int(x.strip()) for x in args.ports.split(",")))
+            if not parsed_ports or any(not 1 <= port <= 65535 for port in parsed_ports):
+                raise ValueError
+        except ValueError:
+            parser.error("--ports requires comma-separated integers in 1..65535")
+    if args.analyze or args.import_nmap:
+        if args.resume:
+            parser.error("Offline analysis does not use --resume; pass the directory to --analyze")
+        try:
+            imported = parse_nmap(args.import_nmap, args.target) if args.import_nmap else None
+            output_dir = make_output_dir("offline", args.output_dir)
+            ctx = ScanContext(target=imported['target'] if imported else (args.target or "offline"),
+                              output_dir=output_dir, flag_prefixes=args.flag_prefix,
+                              include_hashes=args.include_hashes)
+            if imported:
+                ctx.open_ports = [OpenPort(**port) for port in imported['ports']]
+                for script in imported['scripts']:
+                    record_flags(ctx, script['output'], f"{args.import_nmap}: NSE {script['id']}")
+                build_recommendations(ctx)
+            if args.analyze:
+                missing = [str(path) for path in args.analyze if not Path(path).exists()]
+                if missing:
+                    parser.error("Missing analysis input: " + ", ".join(missing))
+                scanner = ArtifactScanner(args.flag_prefix, args.include_hashes)
+                merge_findings(ctx, scanner.scan(args.analyze))
+                ctx.analysis_warnings.extend(scanner.warnings)
+            write_final_report(ctx)
+            out(f"Offline analysis: {len({f['value'] for f in ctx.flag_evidence})} unique candidates; {len(ctx.analysis_warnings)} warning(s).", "green")
+            out(f"Reports: {output_dir.resolve()} (SUMMARY.txt, SUMMARY.md, REPORT.json)")
+            return 0
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
+        except Exception as exc:
+            out(f"Offline analysis failed: {exc}", "red")
+            return 2
 
     print_banner()
     out("Only scan systems you own or are explicitly authorized to test.\n", "yellow", bold=True)
@@ -2052,7 +2141,24 @@ def main() -> int:
     else:
         output_dir = make_output_dir(raw_target, args.output_dir)
 
-    ctx = ScanContext(target=raw_target, output_dir=output_dir)
+    # Bind phase markers to the target and scan settings so resume cannot mix evidence.
+    manifest = output_dir / "session.json"
+    settings = {k: v for k, v in vars(args).items() if k not in {"resume", "output_dir", "target"}}
+    session = {"target": raw_target, "settings": settings, "tool_version": Brand.VERSION}
+    if manifest.exists():
+        try:
+            if json.loads(manifest.read_text()) != session:
+                out("Target/options/version differ from this directory's session; use a new output directory.", "red")
+                return 2
+        except (ValueError, OSError):
+            out("Cannot read session metadata; use a new output directory.", "red")
+            return 2
+    elif any(output_dir.iterdir()):
+        out("Existing results have no session metadata. Use a new directory, or --analyze for offline review.", "red")
+        return 2
+    manifest.write_text(json.dumps(session, indent=2))
+    ctx = ScanContext(target=raw_target, output_dir=output_dir, flag_prefixes=args.flag_prefix,
+                      include_hashes=args.include_hashes)
     out(f"Output directory: {output_dir}\n", "blue")
 
     ctx.tool_status = check_tools()
@@ -2061,7 +2167,7 @@ def main() -> int:
     try:
         if args.ports:
             try:
-                ports = [int(x.strip()) for x in args.ports.split(",") if x.strip()]
+                ports = parsed_ports
             except ValueError:
                 out(f"Invalid --ports value: {args.ports!r}. Use e.g. -p 80,22,445", "red", bold=True)
                 return 2
@@ -2080,8 +2186,14 @@ def main() -> int:
 
         if args.udp:
             udp_marker = ctx.output_dir / "nmap" / "udp_scan.done"
-            if resume_mode and phase_is_done(udp_marker):
-                out(f"  [resume] UDP sweep already done (found {udp_marker}) — skipping.", "blue")
+            if resume_mode and phase_is_done(udp_marker) and (ctx.output_dir / "nmap" / "udp_scan.txt").exists():
+                udp_output = (ctx.output_dir / "nmap" / "udp_scan.txt").read_text(errors="replace")
+                for match in re.finditer(r"(?m)^\s*(\d+)/udp\s+(open(?:\|filtered)?)\s+(\S+)", udp_output):
+                    number = int(match.group(1))
+                    if not any(p.port == number and p.protocol == "udp" for p in ctx.open_ports):
+                        ctx.open_ports.append(OpenPort(number, "udp", match.group(3), state=match.group(2)))
+                record_flags(ctx, udp_output, "nmap UDP output")
+                out("  [resume] Restored UDP scan evidence.", "blue")
             else:
                 phase_udp_scan(ctx, top_ports=args.udp_top_ports)
 
@@ -2108,6 +2220,8 @@ def main() -> int:
         original_ports = ctx.open_ports
         filtered = []
         for p in original_ports:
+            if p.protocol != "tcp" or p.state != "open":
+                continue
             if args.no_http and _matches(p, HTTP_PORTS, HTTP_SERVICE_NAMES):
                 continue
             if args.no_smb and _matches(p, SMB_PORTS, SMB_SERVICE_NAMES):
@@ -2116,11 +2230,13 @@ def main() -> int:
                 continue
             filtered.append(p)
         ctx.open_ports = filtered
-        phase_service_enum(ctx, ctx.tool_status, args.thorough, args.wordlist, args.dirb_timeout,
-                            args.nikto_timeout, args.vhost, args.vhost_domain, args.vhost_wordlist,
-                            resume=resume_mode, no_windows=args.no_windows,
-                            windows_timeout=args.windows_timeout)
-        ctx.open_ports = original_ports
+        try:
+            phase_service_enum(ctx, ctx.tool_status, args.thorough, args.wordlist, args.dirb_timeout,
+                                args.nikto_timeout, args.vhost, args.vhost_domain, args.vhost_wordlist,
+                                resume=resume_mode, no_windows=args.no_windows,
+                                windows_timeout=args.windows_timeout)
+        finally:
+            ctx.open_ports = original_ports
 
         build_recommendations(ctx)
         final_flag_sweep(ctx)
