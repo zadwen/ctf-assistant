@@ -1,3 +1,18 @@
+# 2.2.0
+
+- Added bounded web mapping to the default IP scan workflow and --web-url mode.
+- Followed same-origin HTML, robots/sitemap, JavaScript and source-map references.
+- Analyzed response headers and embedded original source for flag candidates.
+- Inventoried HTML forms and useful comments without executing JS or submitting forms.
+- Added soft-404 baselines, equal-body annotation, and action-like URL skipping.
+- Added per-origin request/depth/time/byte limits, scoped redirects, and saved bodies.
+- Added NEXT_STEPS.md and WEB_MAP.md; REPORT.json now has schema_version 2.
+- Restored saved web evidence when normal scans resume.
+- Fixed HTTP success markers after nonzero Gobuster/ffuf/Nikto exits.
+- Added ffuf auto-calibration and passed full scheme-aware URLs to Nikto.
+- Added local HTTP challenge tests for IP integration, source maps, headers, forms,
+  soft-404s, redirects, request/depth/body/time limits, duplicates, and web-only CLI.
+
 # 2.1.0
 
 - Added modular offline evidence engine and --analyze CLI.

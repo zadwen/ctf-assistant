@@ -22,7 +22,7 @@ KNOWN_PREFIXES = {'htb', 'thm', 'flag', 'ctf', 'picoctf', 'root'}
 BRACED = re.compile(r'\b[A-Za-z][A-Za-z0-9_]{0,31}\{[^{}\r\n]{1,256}\}')
 HASH = re.compile(r'(?<![A-Za-z0-9])[a-fA-F0-9]{32}(?![A-Za-z0-9])')
 FLAG_SOURCE = re.compile(r'(?:^|[/\\\s:!])(?:user|root|flag|proof|local)\.txt(?:$|[\s?\]\'"#])', re.I)
-REPORT_NAMES = {'SUMMARY.txt', 'SUMMARY.md', 'REPORT.json', 'CANDIDATES.md', 'session.json'}
+REPORT_NAMES = {'SUMMARY.txt', 'SUMMARY.md', 'REPORT.json', 'CANDIDATES.md', 'session.json', 'crawl.json', 'NEXT_STEPS.md', 'WEB_MAP.md'}
 
 
 def detect(text, source='', prefixes=(), include_hashes=False):
@@ -237,12 +237,13 @@ def merge_findings(ctx, findings):
 
 def write_json_report(ctx, version):
     """Stable machine-readable evidence; no claim of platform verification."""
-    report = dict(schema_version=1, tool_version=version, target=ctx.target,
+    report = dict(schema_version=2, tool_version=version, target=ctx.target,
                   candidate_count=len({f['value'] for f in ctx.flag_evidence}),
                   flags_verified=False, candidates=ctx.flag_evidence,
                   ports=[vars(p) for p in ctx.open_ports],
                   recommendations=list(dict.fromkeys(ctx.recommendations)),
-                  quick_wins=list(dict.fromkeys(ctx.quick_wins)), warnings=ctx.analysis_warnings)
+                  quick_wins=list(dict.fromkeys(ctx.quick_wins)), warnings=list(dict.fromkeys(ctx.analysis_warnings)),
+                  next_steps=getattr(ctx, 'next_steps', []), web=getattr(ctx, 'web_results', []))
     destination = ctx.output_dir / 'REPORT.json'
     temporary = destination.with_suffix('.json.tmp')
     temporary.write_text(json.dumps(report, indent=2, ensure_ascii=True), encoding='utf-8')

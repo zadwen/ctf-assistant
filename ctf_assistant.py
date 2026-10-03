@@ -52,6 +52,8 @@ import json
 import hashlib
 from urllib.parse import urljoin, urlsplit
 from ctf_evidence import (detect, ArtifactScanner, merge_findings, parse_nmap, write_json_report)
+from ctf_web import WebMapper, canonical_url, origin
+from ctf_triage import write_triage
 import re
 import shutil
 import socket
@@ -97,7 +99,7 @@ except ImportError:
 class Brand:
     NAME = "CTF Recon Assistant"
     AUTHOR = "zadwen"
-    VERSION = "2.1.0"
+    VERSION = "2.2.0"
     REPO = "github.com/zadwen/ctf-assistant"
 
     BANNER = r"""
@@ -231,6 +233,13 @@ class ScanContext:
     analysis_warnings: list[str] = field(default_factory=list)
     flag_prefixes: list[str] = field(default_factory=list)
     include_hashes: bool = False
+    web_results: list[dict] = field(default_factory=list)
+    next_steps: list[dict] = field(default_factory=list)
+    crawl_enabled: bool = True
+    web_pages: int = 60
+    web_depth: int = 3
+    web_seconds: int = 120
+    web_delay: float = 0.1
 
 
 # ==========================================================================
@@ -869,12 +878,38 @@ def auto_fetch_and_scan(ctx: ScanContext, base_url: str, paths: list[str],
     return fetched
 
 
+def add_web_result(ctx: ScanContext, result: dict) -> None:
+    ctx.web_results = [item for item in ctx.web_results if item['base_url'] != result['base_url']]
+    ctx.web_results.append(result)
+    merge_findings(ctx, result.get('findings', []))
+    ctx.analysis_warnings.extend(w for w in result.get('warnings', []) if w not in ctx.analysis_warnings)
+
+
+def new_web_mapper(ctx: ScanContext, url: str) -> WebMapper:
+    identity = hashlib.sha256(url.encode()).hexdigest()[:12]
+    return WebMapper(url, ctx.output_dir / 'web' / identity,
+                     max_requests=ctx.web_pages, max_depth=ctx.web_depth,
+                     seconds=ctx.web_seconds, delay=ctx.web_delay,
+                     prefixes=ctx.flag_prefixes, include_hashes=ctx.include_hashes)
+
+
+def load_web_results(ctx: ScanContext) -> None:
+    for path in (ctx.output_dir / 'web').glob('*/crawl.json'):
+        try:
+            result = json.loads(path.read_text(encoding='utf-8'))
+            if isinstance(result, dict) and isinstance(result.get('base_url'), str):
+                add_web_result(ctx, result)
+        except (OSError, ValueError, KeyError, TypeError):
+            ctx.analysis_warnings.append(f'Could not load web evidence: {path}')
+
+
 def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, bool], thorough: bool,
                      wordlist_override: Optional[str] = None, dirb_timeout: int = 300,
                      nikto_timeout: int = 150, vhost: bool = False,
                      vhost_domain: Optional[str] = None, vhost_wordlist: Optional[str] = None) -> bool:
-    scheme = "https" if port.port in (443, 8443) else "http"
-    base_url = f"{scheme}://{ctx.target}:{port.port}/"
+    scheme = "https" if port.port in (443, 8443) or port.service in ("ssl/http", "https") else "http"
+    web_target = f"[{ctx.target}]" if ":" in ctx.target else ctx.target
+    base_url = f"{scheme}://{web_target}:{port.port}/"
     out(f"\n  [HTTP] Enumerating {base_url}", "cyan", bold=True)
     http_out_dir = ctx.output_dir / "http"
 
@@ -889,7 +924,7 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
     probe_ok = safe_fetch(base_url) is not None
     if not probe_ok:
         alt_scheme = "https" if scheme == "http" else "http"
-        alt_url = f"{alt_scheme}://{ctx.target}:{port.port}/"
+        alt_url = f"{alt_scheme}://{web_target}:{port.port}/"
         if safe_fetch(alt_url) is not None:
             out(f"    [!] No response over {scheme}, but {alt_scheme} works — nmap's "
                 f"{scheme}/{alt_scheme} guess (based on port number) was backwards. "
@@ -920,24 +955,26 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
     # silently treated as complete on a later --resume.
     phase_complete = True
 
-    # 1. Always check a curated list of high-value CTF paths directly —
-    #    cheap, fast, and often where the flag or a foothold actually is.
-    out("    Checking common CTF paths (robots.txt, .git, backups, ...)", "bright_black")
-    fetched = auto_fetch_and_scan(ctx, base_url, COMMON_CTF_PATHS, http_out_dir)
-
-    # 1b. robots.txt / sitemap.xml are the site's own map of "don't look
-    #     here" — follow whatever they disclose, since that's frequently
-    #     exactly where a CTF flag lives.
-    disclosed_paths: list[str] = []
-    for rel_path, text in fetched:
-        if rel_path.rstrip("/").endswith("robots.txt"):
-            disclosed_paths += extract_robots_paths(text)
-        elif rel_path.rstrip("/").endswith("sitemap.xml"):
-            disclosed_paths += extract_sitemap_paths(text)
-    if disclosed_paths:
-        out(f"    robots.txt/sitemap.xml disclosed {len(disclosed_paths)} more path(s) — following...",
-            "bright_black")
-        auto_fetch_and_scan(ctx, base_url, disclosed_paths, http_out_dir)
+    mapper = None
+    if ctx.crawl_enabled:
+        out(f"    Mapping web evidence (up to {ctx.web_pages} requests / {ctx.web_seconds}s)...", "bright_black")
+        mapper = new_web_mapper(ctx, base_url)
+        try:
+            mapper.run()
+        finally:
+            add_web_result(ctx, vars(mapper.result))
+        phase_complete = phase_complete and mapper.result.complete
+        out(f"    Web map: {len(mapper.result.pages)} pages, {len(mapper.result.leads)} leads.", "green")
+    else:
+        fetched = auto_fetch_and_scan(ctx, base_url, COMMON_CTF_PATHS, http_out_dir)
+        disclosed_paths = []
+        for rel_path, text in fetched:
+            if rel_path.rstrip("/").endswith("robots.txt"):
+                disclosed_paths += extract_robots_paths(text)
+            elif rel_path.rstrip("/").endswith("sitemap.xml"):
+                disclosed_paths += extract_sitemap_paths(text)
+        if disclosed_paths:
+            auto_fetch_and_scan(ctx, base_url, disclosed_paths, http_out_dir)
 
     # 2. Directory brute-force with gobuster/ffuf, extensions included.
     wordlist = find_wordlist(thorough=thorough, override=wordlist_override)
@@ -972,11 +1009,13 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
                 f"higher --dirb-timeout, or a smaller wordlist, to get a complete listing."
             )
             phase_complete = False
+        if rc != 0:
+            phase_complete = False
         discovered_paths = parse_gobuster_paths(gb_output)
     elif tool_status.get("ffuf"):
         log_path = http_out_dir / f"ffuf_{port.port}.txt"
         cmd = [
-            "ffuf",
+            "ffuf", "-ac",
             "-u", f"{base_url}FUZZ",
             "-w", wordlist,
             "-e", "." + ",.".join(CTF_EXTENSIONS.split(",")),
@@ -995,6 +1034,8 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
                 f"higher --dirb-timeout, or a smaller wordlist, to get a complete listing."
             )
             phase_complete = False
+        if rc != 0:
+            phase_complete = False
         csv_path = log_path.with_suffix(".csv")
         if csv_path.exists():
             discovered_paths = parse_ffuf_csv_paths(csv_path.read_text(errors="replace"))
@@ -1007,12 +1048,19 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
             f"{' ...' if len(discovered_paths) > len(preview) else ''}", "green")
         out(f"    Auto-fetching {min(len(discovered_paths), MAX_AUTO_FETCHED_PATHS)} "
             f"discovered 200-OK path(s) and scanning for flags...", "bright_black")
-        auto_fetch_and_scan(ctx, base_url, discovered_paths, http_out_dir)
+        if mapper:
+            try:
+                mapper.run(discovered_paths)
+            finally:
+                add_web_result(ctx, vars(mapper.result))
+            phase_complete = phase_complete and mapper.result.complete
+        else:
+            auto_fetch_and_scan(ctx, base_url, discovered_paths, http_out_dir)
 
     # 3. nikto for known web-server vulnerabilities.
     if tool_status.get("nikto"):
         log_path = http_out_dir / f"nikto_{port.port}.txt"
-        cmd = ["nikto", "-h", f"{ctx.target}:{port.port}", "-nointeractive"]
+        cmd = ["nikto", "-h", base_url, "-nointeractive"]
         rc, nikto_output = spinner_run(f"nikto scanning port {port.port}...", cmd, log_path,
                                         timeout=nikto_timeout)
         out(f"    nikto log: {log_path}", "green")
@@ -1023,6 +1071,8 @@ def phase_http_enum(ctx: ScanContext, port: OpenPort, tool_status: dict[str, boo
                 f"Port {port.port}: nikto timed out after {nikto_timeout}s — re-run with a "
                 f"higher --nikto-timeout if you have time to spare."
             )
+            phase_complete = False
+        elif rc != 0:
             phase_complete = False
         else:
             findings = [ln.strip() for ln in nikto_output.splitlines() if ln.strip().startswith("+")
@@ -1080,8 +1130,9 @@ def phase_vhost_fuzz(ctx: ScanContext, port: OpenPort, tool_status: dict[str, bo
         return True
 
     out(f"\n  [VHOST] Fuzzing subdomains of {domain} via Host header on port {port.port}", "cyan", bold=True)
-    scheme = "https" if port.port in (443, 8443) else "http"
-    base_url = f"{scheme}://{ctx.target}:{port.port}/"
+    scheme = "https" if port.port in (443, 8443) or port.service in ("ssl/http", "https") else "http"
+    web_target = f"[{ctx.target}]" if ":" in ctx.target else ctx.target
+    base_url = f"{scheme}://{web_target}:{port.port}/"
     out_dir = ctx.output_dir / "http"
 
     if tool_status.get("gobuster"):
@@ -1845,6 +1896,7 @@ def print_port_summary(ctx: ScanContext) -> None:
 
 def final_flag_sweep(ctx: ScanContext) -> None:
     """Analyze collected artifacts, including bounded archive/encoding support."""
+    load_web_results(ctx)
     scanner = ArtifactScanner(ctx.flag_prefixes, ctx.include_hashes)
     merge_findings(ctx, scanner.scan([ctx.output_dir]))
     ctx.analysis_warnings.extend(scanner.warnings)
@@ -1938,6 +1990,7 @@ def write_final_report(ctx: ScanContext) -> Path:
     lines.extend(["", "=== Analysis warnings ===", *dict.fromkeys(ctx.analysis_warnings),
                   "", "All candidates, confidence and decoding provenance: REPORT.json"])
     report_path.write_text("\n".join(lines))
+    write_triage(ctx)
     write_markdown_report(ctx)
     write_json_report(ctx, Brand.VERSION)
     return report_path
@@ -2061,6 +2114,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--flag-prefix", action="append", default=[], help="Recognize an additional event prefix; repeatable (e.g. --flag-prefix MYCTF).")
     p.add_argument("--include-hashes", action="store_true", help="Include unlabelled 32-hex strings as low-confidence evidence in REPORT.json.")
     p.add_argument("--version", action="version", version=Brand.VERSION)
+    p.add_argument("--web-url", metavar="URL", help="Run just the bounded web mapper against an assigned HTTP(S) URL; no Nmap needed.")
+    p.add_argument("--no-crawl", action="store_true", help="Use legacy HTTP discovery without the new web mapper.")
+    p.add_argument("--web-pages", type=int, default=60, help="Web mapper request cap per origin, including probes/redirects (default: 60).")
+    p.add_argument("--web-depth", type=int, default=3, help="Web mapper link depth (default: 3; maximum: 8).")
+    p.add_argument("--web-seconds", type=int, default=120, help="Cumulative mapper time budget per origin (default: 120; excludes other tools).")
+    p.add_argument("--web-delay", type=float, default=0.1, help="Minimum interval between web mapper requests in seconds (default: 0.1).")
     return p
 
 
@@ -2085,6 +2144,37 @@ def main() -> int:
                 raise ValueError
         except ValueError:
             parser.error("--ports requires comma-separated integers in 1..65535")
+    if not 4 <= args.web_pages <= 1000:
+        parser.error("--web-pages must be between 4 and 1000")
+    if not 0 <= args.web_depth <= 8 or not 1 <= args.web_seconds <= 3600:
+        parser.error("--web-depth must be 0..8 and --web-seconds must be 1..3600")
+    if not 0 <= args.web_delay <= 10:
+        parser.error("--web-delay must be between 0 and 10 seconds")
+    if args.web_url:
+        if args.target or args.analyze or args.import_nmap or args.resume or args.no_crawl or args.no_http:
+            parser.error("--web-url cannot be combined with --target, offline inputs, --resume, --no-crawl or --no-http")
+        try:
+            url = canonical_url(args.web_url)
+            output_dir = make_output_dir("web", args.output_dir)
+            if any(output_dir.iterdir()):
+                parser.error("--web-url needs a new/empty output directory to keep challenge evidence separate")
+            ctx = ScanContext(target=url, output_dir=output_dir, flag_prefixes=args.flag_prefix,
+                              include_hashes=args.include_hashes, web_pages=args.web_pages,
+                              web_depth=args.web_depth, web_seconds=args.web_seconds, web_delay=args.web_delay)
+            mapper = new_web_mapper(ctx, url)
+            interrupted = False
+            try:
+                mapper.run()
+            except KeyboardInterrupt:
+                interrupted = True
+            add_web_result(ctx, vars(mapper.result))
+            final_flag_sweep(ctx)
+            write_final_report(ctx)
+            out(f"Web map: {len(mapper.result.pages)} pages, {len(mapper.result.leads)} leads; {len(ctx.flags_found)} candidate observations.", "green")
+            out(f"Read {output_dir.resolve() / 'NEXT_STEPS.md'} and WEB_MAP.md")
+            return 130 if interrupted else (0 if mapper.result.pages else 1)
+        except (OSError, ValueError) as exc:
+            parser.error(str(exc))
     if args.analyze or args.import_nmap:
         if args.resume:
             parser.error("Offline analysis does not use --resume; pass the directory to --analyze")
@@ -2159,6 +2249,9 @@ def main() -> int:
     manifest.write_text(json.dumps(session, indent=2))
     ctx = ScanContext(target=raw_target, output_dir=output_dir, flag_prefixes=args.flag_prefix,
                       include_hashes=args.include_hashes)
+    ctx.crawl_enabled = not args.no_crawl
+    ctx.web_pages, ctx.web_depth = args.web_pages, args.web_depth
+    ctx.web_seconds, ctx.web_delay = args.web_seconds, args.web_delay
     out(f"Output directory: {output_dir}\n", "blue")
 
     ctx.tool_status = check_tools()
@@ -2248,6 +2341,7 @@ def main() -> int:
         section("Done")
         out(f"Full logs saved under: {ctx.output_dir}", "green")
         out(f"Summary report: {report_path} (and SUMMARY.md)", "green", bold=True)
+        out(f"Prioritized checklist: {ctx.output_dir / 'NEXT_STEPS.md'}; web map: WEB_MAP.md", "green")
         if ctx.flags_found:
             out(f"\n*** {len(ctx.flags_found)} possible flag(s) found — check QUICK WINS above! ***",
                 "magenta", bold=True)
